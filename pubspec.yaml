@@ -11,10 +11,11 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  mavlink_module:
-    git:
-      url: https://github.com/karthikeya-tummala-nrt/mavlink_module
-      ref: stable-main
+  mavlink_dart:
+#    git:
+#      url: https://github.com/karthikeya-tummala-nrt/mavlink_module
+#      ref: stable-main
+    path: /Users/satheeshkumar/Work/Projects/mavlink_dart
 
 dev_dependencies:
   flutter_test:
