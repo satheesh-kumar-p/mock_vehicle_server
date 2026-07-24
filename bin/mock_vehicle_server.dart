@@ -56,6 +56,7 @@ int _tickCount = 0;
 late DateTime _bootTime;
 late final MavlinkParser _parser;
 late final MavlinkSignatureManager _signatureManager;
+Process? _gstreamerProcess;
 
 // ── ICD encodings (COMP_UGV_STATUS / UGV_SYSTEM_INFO v1.3) ───────────────
 
@@ -174,6 +175,10 @@ class _MockUgvState {
   bool homeSet = true;
   bool pathSaving = false;
 
+  // Fixed home position reported in UGV_SYSTEM_INFO (updated by SET_HOME)
+  int homeLatE7 = homeLat;
+  int homeLonE7 = homeLon;
+
   // Camera health in sensor_subsystem_health_4: 1=Healthy per 2-bit field
   int cameraHealthWord = 0x5555;
 
@@ -218,8 +223,14 @@ Future<void> main() async {
   print('║ Sending to GCS  : $gcsHost:$gcsPort  ║');
   print('║ Vehicle sys/comp: $vehicleSysId / $vehicleCompId ║');
   print('║ Clock offset    : ${vehicleClockOffsetMs}ms║');
+  print(
+    '║ Video RTP       : ${ServerConfig.videoStreamHost}:'
+    '${ServerConfig.videoStreamPort}║',
+  );
   print('╚══════════════════════════════════════╝');
   print('Silvus radio: dart run bin/mock_radio_server.dart');
+
+  await _startGstreamerVideo();
 
   _socket.listen((RawSocketEvent event) {
     if (event != RawSocketEvent.read) return;
@@ -250,7 +261,87 @@ Future<void> main() async {
   });
 
   print('\nServer running. Press Ctrl+C to stop.\n');
-  await Future<void>.delayed(const Duration(days: 365));
+
+  // Keep process alive until SIGINT/SIGTERM, then tear down GStreamer.
+  final stop = Completer<void>();
+  void requestStop(ProcessSignal signal) {
+    if (stop.isCompleted) return;
+    print('\n[$signal] Shutting down…');
+    stop.complete();
+  }
+
+  ProcessSignal.sigint.watch().listen(requestStop);
+  if (!Platform.isWindows) {
+    ProcessSignal.sigterm.watch().listen(requestStop);
+  }
+
+  await stop.future;
+  await _stopGstreamerVideo();
+}
+
+Future<void> _startGstreamerVideo() async {
+  final host = ServerConfig.videoStreamHost;
+  final port = ServerConfig.videoStreamPort;
+  final args = <String>[
+    '-v',
+    'videotestsrc',
+    'is-live=true',
+    'pattern=ball',
+    '!',
+    'video/x-raw,width=1280,height=720,framerate=30/1',
+    '!',
+    'videoconvert',
+    '!',
+    'x264enc',
+    'tune=zerolatency',
+    'speed-preset=ultrafast',
+    'key-int-max=30',
+    '!',
+    'rtph264pay',
+    'pt=96',
+    'config-interval=1',
+    '!',
+    'udpsink',
+    'host=$host',
+    'port=$port',
+  ];
+
+  try {
+    final process = await Process.start('gst-launch-1.0', args);
+    _gstreamerProcess = process;
+    print('[GST] H.264 RTP test pattern → udp://$host:$port (pid=${process.pid})');
+
+    process.stdout
+        .transform(const SystemEncoding().decoder)
+        .listen((line) => stdout.write('[GST] $line'));
+    process.stderr
+        .transform(const SystemEncoding().decoder)
+        .listen((line) => stderr.write('[GST] $line'));
+    process.exitCode.then((code) {
+      if (identical(_gstreamerProcess, process)) {
+        _gstreamerProcess = null;
+      }
+      print('[GST] exited with code $code');
+    });
+  } on ProcessException catch (e) {
+    print(
+      '[GST] Failed to start gst-launch-1.0 ($e). '
+      'Install GStreamer or start the pipeline manually.',
+    );
+  }
+}
+
+Future<void> _stopGstreamerVideo() async {
+  final process = _gstreamerProcess;
+  if (process == null) return;
+  _gstreamerProcess = null;
+  print('[GST] Stopping pid=${process.pid}');
+  process.kill(ProcessSignal.sigint);
+  try {
+    await process.exitCode.timeout(const Duration(seconds: 2));
+  } on TimeoutException {
+    process.kill(ProcessSignal.sigkill);
+  }
 }
 
 void _handleIncomingFrame(MavlinkFrame frame) {
@@ -339,9 +430,15 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
         print('[CMD] REMOTE_EMERGENCY state=$p1');
       }
     case cmdSetHome:
+      // ICD 5.1.6.2.12: param1=1 → set current GPS_RAW_INT lat/lon as home
       if (p1 == 1) {
         s.homeSet = true;
-        print('[CMD] SET_HOME current position');
+        s.homeLatE7 = s.gpsLatE7;
+        s.homeLonE7 = s.gpsLonE7;
+        print(
+          '[CMD] SET_HOME current position → '
+          'lat=${s.homeLatE7 / 1e7} lon=${s.homeLonE7 / 1e7}',
+        );
       }
     default:
       print(
@@ -381,14 +478,14 @@ void _sendSystemTime() {
   );
 }
 
-/// Advance circular GPS position + COG at 1 Hz around [homeLat]/[homeLon].
+/// Advance circular GPS position + COG at 1 Hz around current home.
 void _tickGpsMotion() {
   final s = _state;
   final omega = gpsCircleSpeedMs / gpsCircleRadiusM; // rad/s at 1 Hz ticks
   s.gpsCircleTheta = (s.gpsCircleTheta + omega) % (2 * math.pi);
 
-  final homeLatDeg = homeLat / 1e7;
-  final homeLonDeg = homeLon / 1e7;
+  final homeLatDeg = s.homeLatE7 / 1e7;
+  final homeLonDeg = s.homeLonE7 / 1e7;
   final metersPerDegLon =
       metersPerDegLat * math.cos(homeLatDeg * math.pi / 180);
 
@@ -588,8 +685,8 @@ UgvSystemInfo _buildUgvSystemInfo() {
     compInterfaceHealth1: s.compInterfaceHealth1,
     compInterfaceHealth2: s.compInterfaceHealth2,
     homeLocation: homeLocation,
-    lat: s.homeSet ? s.gpsLatE7 : 0,
-    lon: s.homeSet ? s.gpsLonE7 : 0,
+    lat: s.homeSet ? s.homeLatE7 : 0,
+    lon: s.homeSet ? s.homeLonE7 : 0,
   );
 }
 

@@ -15,6 +15,9 @@ dart run bin/mock_vehicle_server.dart
 
 Listens on UDP `7000`, sends to GCS on `7500` (see `lib/config/server_config.dart`).
 
+On start it also launches a GStreamer H.264 RTP test pattern to `udp://127.0.0.1:5000`
+(`gst-launch-1.0` must be on `PATH`).
+
 ## Run radio mock (independent)
 
 ```bash

@@ -43,4 +43,8 @@ class ServerConfig {
 
   /// Default node id when not using §5 Table 2 sample (sample uses 1025).
   static const int radioNodeId = 1025;
+
+  // ── Mock camera (GStreamer H.264 RTP test pattern) ─────────────────────
+  static const String videoStreamHost = '127.0.0.1';
+  static const int videoStreamPort = 5000;
 }
