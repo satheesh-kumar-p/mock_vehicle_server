@@ -39,9 +39,9 @@ const int cmdLightControl = 31901;
 const int cmdCameraMarker = 31902;
 const int cmdRemoteEmergency = 31904;
 
-// Bangalore map center (matches GCS MapConfig.fallbackPosition)
-const int homeLat = 130828500; // 13.08285°
-const int homeLon = 776234500; // 77.62345°
+// Bangalore map center — fixed GPS orbit center (independent of SET_HOME)
+const int orbitLat = 130828500; // 13.08285°
+const int orbitLon = 776234500; // 77.62345°
 
 // Continuous circle for marker-animation testing
 const double gpsCircleRadiusM = 500.0;
@@ -172,20 +172,20 @@ class _MockUgvState {
   int secCompStatus = 0x003F; // interfaces active, secondary compute healthy
   int compInterfaceHealth2 = 0x01FF; // interfaces + GMSL 1-8 active
 
-  bool homeSet = true;
+  bool homeSet = false;
   bool pathSaving = false;
 
-  // Fixed home position reported in UGV_SYSTEM_INFO (updated by SET_HOME)
-  int homeLatE7 = homeLat;
-  int homeLonE7 = homeLon;
+  // Home reported in UGV_SYSTEM_INFO — latched from GPS_RAW_INT on SET_HOME
+  int homeLatE7 = 0;
+  int homeLonE7 = 0;
 
   // Camera health in sensor_subsystem_health_4: 1=Healthy per 2-bit field
   int cameraHealthWord = 0x5555;
 
-  // GNSS / attitude simulation
-  int gpsLatE7 = homeLat;
-  int gpsLonE7 = homeLon;
-  double gpsCircleTheta = 0.0; // rad; angle on circle around home
+  // GNSS / attitude simulation (orbits fixed [orbitLat]/[orbitLon], not home)
+  int gpsLatE7 = orbitLat;
+  int gpsLonE7 = orbitLon;
+  double gpsCircleTheta = 0.0; // rad; angle on circle around orbit center
   int gpsAltMm = 920000; // 920 m MSL
   int gpsHeadingCd = 4500; // 45.00°
   int gpsSpeedCms = 150; // 1.50 m/s while circling
@@ -249,8 +249,11 @@ Future<void> main() async {
     _tickUgvSystemInfo();
     final ugv = _buildUgvSystemInfo();
     final sent = _send(ugv);
+    final s = _state;
     print(
-      '[UGV] sent → $sent bytes',
+      '[UGV] sent → $sent bytes'
+      '${s.homeSet ? ' home=${s.homeLatE7},${s.homeLonE7}' : ' home=unset'}'
+      ' gps=${s.gpsLatE7},${s.gpsLonE7}',
     );
   });
 
@@ -430,15 +433,26 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
         print('[CMD] REMOTE_EMERGENCY state=$p1');
       }
     case cmdSetHome:
-      // ICD 5.1.6.2.12: param1=1 → set current GPS_RAW_INT lat/lon as home
+      // ICD 5.1.6.2.12: param1=1 → latch current GPS_RAW_INT lat/lon as home
       if (p1 == 1) {
         s.homeSet = true;
         s.homeLatE7 = s.gpsLatE7;
         s.homeLonE7 = s.gpsLonE7;
         print(
-          '[CMD] SET_HOME current position → '
-          'lat=${s.homeLatE7 / 1e7} lon=${s.homeLonE7 / 1e7}',
+          '[CMD] SET_HOME latched GPS_RAW_INT → '
+          'lat=${s.homeLatE7} lon=${s.homeLonE7} '
+          '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7})',
         );
+        // Push UGV_SYSTEM_INFO immediately so GCS sees the latch
+        // before the next GPS motion tick.
+        final ugv = _buildUgvSystemInfo();
+        final sent = _send(ugv);
+        print(
+          '[UGV] SET_HOME status → home lat=${ugv.lat} lon=${ugv.lon} '
+          '($sent bytes)',
+        );
+      } else {
+        print('[CMD] SET_HOME ignored — param1=$p1 (need 1)');
       }
     default:
       print(
@@ -478,23 +492,24 @@ void _sendSystemTime() {
   );
 }
 
-/// Advance circular GPS position + COG at 1 Hz around current home.
+/// Advance circular GPS position + COG at 1 Hz around fixed [orbitLat]/[orbitLon].
+/// Home (SET_HOME) is independent — latching home must not move the GPS orbit.
 void _tickGpsMotion() {
   final s = _state;
   final omega = gpsCircleSpeedMs / gpsCircleRadiusM; // rad/s at 1 Hz ticks
   s.gpsCircleTheta = (s.gpsCircleTheta + omega) % (2 * math.pi);
 
-  final homeLatDeg = s.homeLatE7 / 1e7;
-  final homeLonDeg = s.homeLonE7 / 1e7;
+  final orbitLatDeg = orbitLat / 1e7;
+  final orbitLonDeg = orbitLon / 1e7;
   final metersPerDegLon =
-      metersPerDegLat * math.cos(homeLatDeg * math.pi / 180);
+      metersPerDegLat * math.cos(orbitLatDeg * math.pi / 180);
 
   // Offset from center: north = r·cos(θ), east = r·sin(θ)
   final northM = gpsCircleRadiusM * math.cos(s.gpsCircleTheta);
   final eastM = gpsCircleRadiusM * math.sin(s.gpsCircleTheta);
 
-  final latDeg = homeLatDeg + northM / metersPerDegLat;
-  final lonDeg = homeLonDeg + eastM / metersPerDegLon;
+  final latDeg = orbitLatDeg + northM / metersPerDegLat;
+  final lonDeg = orbitLonDeg + eastM / metersPerDegLon;
 
   s.gpsLatE7 = (latDeg * 1e7).round();
   s.gpsLonE7 = (lonDeg * 1e7).round();
