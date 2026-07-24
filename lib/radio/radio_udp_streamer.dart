@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:io';
 
+import '../config/server_config.dart';
 import 'radio_http_server.dart';
 import 'radio_simulator.dart';
 import 'radio_tlv_encoder.dart';
 
-/// Streams Silvus TLV UDP reports to the address configured via JSON-RPC.
+/// Streams Silvus TLV UDP reports to addresses configured via JSON-RPC.
 class RadioUdpStreamer {
   RadioUdpStreamer({
     required RadioSimulator simulator,
@@ -33,14 +34,17 @@ class RadioUdpStreamer {
     _tempTimer?.cancel();
 
     final rssiPeriod = Duration(
-      milliseconds: _httpServer.rssiReportPeriodMs.clamp(100, 60000),
+      milliseconds: _httpServer.rssiReportPeriodMs.clamp(
+        ServerConfig.rssiReportPeriodMinMs,
+        ServerConfig.rssiReportPeriodMaxMs,
+      ),
     );
     final tempPeriod = Duration(
-      seconds: _httpServer.tempReportPeriodSec.clamp(1, 60),
+      seconds: _httpServer.tempReportPeriodSec.clamp(1, 2147483647),
     );
 
     _rssiTimer = Timer.periodic(rssiPeriod, (_) => _sendRssiIfEnabled());
-    _tempTimer = Timer.periodic(tempPeriod, (_) => _sendTemperature());
+    _tempTimer = Timer.periodic(tempPeriod, (_) => _sendTemperatureIfEnabled());
   }
 
   Future<void> stop() async {
@@ -52,12 +56,25 @@ class RadioUdpStreamer {
 
   void _sendRssiIfEnabled() {
     if (!_httpServer.rssiReportingEnabled || !_simulator.isStreaming) return;
-    _sendReport(_encoder.encodeRssiReport(_nextSample()));
+    final sample = _nextSample();
+    _sendReport(
+      _encoder.encodeRssiReport(sample),
+      host: _httpServer.rssiHost,
+      port: _httpServer.rssiPort,
+      kind: 'RSSI',
+    );
   }
 
-  void _sendTemperature() {
+  void _sendTemperatureIfEnabled() {
     if (!_simulator.isStreaming) return;
-    _sendReport(_encoder.encodeTemperatureReport(_nextSample()));
+    final sample = _nextSample();
+    if (!_httpServer.shouldSendTemperature(sample)) return;
+    _sendReport(
+      _encoder.encodeTemperatureReport(sample),
+      host: _httpServer.tempHost,
+      port: _httpServer.tempPort,
+      kind: 'TEMP',
+    );
   }
 
   SimulatedRadioSample _nextSample() {
@@ -66,15 +83,20 @@ class RadioUdpStreamer {
     return sample;
   }
 
-  void _sendReport(List<int> bytes) {
+  void _sendReport(
+    List<int> bytes, {
+    required String host,
+    required int port,
+    required String kind,
+  }) {
     final socket = _socket;
     if (socket == null) return;
 
-    final address = InternetAddress(_httpServer.tlvHost);
-    final sent = socket.send(bytes, address, _httpServer.tlvPort);
+    final address = InternetAddress(host);
+    final sent = socket.send(bytes, address, port);
     if (sent > 0) {
       print(
-        '[RADIO] TLV → ${_httpServer.tlvHost}:${_httpServer.tlvPort} '
+        '[RADIO] $kind TLV → $host:$port '
         '(${bytes.length} bytes, state=${_simulator.state.label})',
       );
     }

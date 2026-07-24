@@ -4,15 +4,13 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:mock_vehicle_server/config/server_config.dart';
-import 'package:mock_vehicle_server/radio/radio_http_server.dart';
-import 'package:mock_vehicle_server/radio/radio_simulator.dart';
-import 'package:mock_vehicle_server/radio/radio_udp_streamer.dart';
 import 'package:mavlink_dart/dialects/ugvcustom.dart';
 import 'package:mavlink_dart/mavlink_frame.dart';
 import 'package:mavlink_dart/mavlink_parser.dart';
 import 'package:mavlink_dart/mavlink_signature.dart';
 
 // ── CONFIG (mirrors scout-td0-GCS RadioConfig in app_constants.dart) ─────
+// Silvus radio mock runs separately: dart run bin/mock_radio_server.dart
 const String gcsHost = ServerConfig.mavlinkHost;
 const int gcsPort = ServerConfig.gcsPort;
 const int serverPort = ServerConfig.vehicleUdpPort;
@@ -41,8 +39,14 @@ const int cmdLightControl = 31901;
 const int cmdCameraMarker = 31902;
 const int cmdRemoteEmergency = 31904;
 
-const int homeLat = 125234567; // 12.5234567°
-const int homeLon = 801234567; // 80.1234567°
+// Bangalore map center (matches GCS MapConfig.fallbackPosition)
+const int homeLat = 130828500; // 13.08285°
+const int homeLon = 776234500; // 77.62345°
+
+// Continuous circle for marker-animation testing
+const double gpsCircleRadiusM = 500.0;
+const double gpsCircleSpeedMs = 1.5; // ~1.5 m/s
+const double metersPerDegLat = 111320.0;
 // ──────────────────────────────────────────────────────────────────────────
 
 late RawDatagramSocket _socket;
@@ -52,10 +56,6 @@ int _tickCount = 0;
 late DateTime _bootTime;
 late final MavlinkParser _parser;
 late final MavlinkSignatureManager _signatureManager;
-
-late final RadioSimulator _radioSimulator;
-late final RadioHttpServer _radioHttpServer;
-late final RadioUdpStreamer _radioUdpStreamer;
 
 // ── ICD encodings (COMP_UGV_STATUS / UGV_SYSTEM_INFO v1.3) ───────────────
 
@@ -178,9 +178,12 @@ class _MockUgvState {
   int cameraHealthWord = 0x5555;
 
   // GNSS / attitude simulation
+  int gpsLatE7 = homeLat;
+  int gpsLonE7 = homeLon;
+  double gpsCircleTheta = 0.0; // rad; angle on circle around home
   int gpsAltMm = 920000; // 920 m MSL
   int gpsHeadingCd = 4500; // 45.00°
-  int gpsSpeedCms = 0;
+  int gpsSpeedCms = 150; // 1.50 m/s while circling
   double rollRad = 0.02;
   double pitchRad = -0.01;
   double yawRad = 0.78;
@@ -203,19 +206,7 @@ Future<void> main() async {
     signatureManager: _signatureManager,
   );
 
-  _radioSimulator = RadioSimulator();
-  _radioHttpServer = RadioHttpServer(simulator: _radioSimulator);
-  _radioUdpStreamer = RadioUdpStreamer(
-    simulator: _radioSimulator,
-    httpServer: _radioHttpServer,
-  );
-  _radioHttpServer.onConfigChanged = _radioUdpStreamer.updateTimers;
-
   _parser.stream.listen(_handleIncomingFrame);
-
-  await _radioHttpServer.start();
-  await _radioUdpStreamer.start();
-  _radioUdpStreamer.updateTimers();
 
   _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, serverPort);
   _socket.broadcastEnabled = true;
@@ -227,10 +218,8 @@ Future<void> main() async {
   print('║ Sending to GCS  : $gcsHost:$gcsPort  ║');
   print('║ Vehicle sys/comp: $vehicleSysId / $vehicleCompId ║');
   print('║ Clock offset    : ${vehicleClockOffsetMs}ms║');
-  print('╠══════════════════════════════════════╣');
-  print('║ Silvus HTTP     : ${ServerConfig.gcsRadioIp}:${ServerConfig.radioHttpPort} ║');
-  print('║ TLV default dest: ${ServerConfig.gcsHostSystemIp}:${ServerConfig.udpStreamingPort} ║');
   print('╚══════════════════════════════════════╝');
+  print('Silvus radio: dart run bin/mock_radio_server.dart');
 
   _socket.listen((RawSocketEvent event) {
     if (event != RawSocketEvent.read) return;
@@ -241,9 +230,7 @@ Future<void> main() async {
 
   Timer.periodic(const Duration(seconds: 1), (_) {
     _tickCount++;
-    _radioSimulator.tick();
     _sendCompHeartbeat();
-    _sendRadioStatus();
     _sendSystemTime();
   });
 
@@ -257,6 +244,7 @@ Future<void> main() async {
   });
 
   Timer.periodic(const Duration(seconds: 1), (_) {
+    _tickGpsMotion();
     _sendGpsRawInt();
     _sendAttitude();
   });
@@ -393,24 +381,60 @@ void _sendSystemTime() {
   );
 }
 
+/// Advance circular GPS position + COG at 1 Hz around [homeLat]/[homeLon].
+void _tickGpsMotion() {
+  final s = _state;
+  final omega = gpsCircleSpeedMs / gpsCircleRadiusM; // rad/s at 1 Hz ticks
+  s.gpsCircleTheta = (s.gpsCircleTheta + omega) % (2 * math.pi);
+
+  final homeLatDeg = homeLat / 1e7;
+  final homeLonDeg = homeLon / 1e7;
+  final metersPerDegLon =
+      metersPerDegLat * math.cos(homeLatDeg * math.pi / 180);
+
+  // Offset from center: north = r·cos(θ), east = r·sin(θ)
+  final northM = gpsCircleRadiusM * math.cos(s.gpsCircleTheta);
+  final eastM = gpsCircleRadiusM * math.sin(s.gpsCircleTheta);
+
+  final latDeg = homeLatDeg + northM / metersPerDegLat;
+  final lonDeg = homeLonDeg + eastM / metersPerDegLon;
+
+  s.gpsLatE7 = (latDeg * 1e7).round();
+  s.gpsLonE7 = (lonDeg * 1e7).round();
+
+  // Tangent COG for CCW motion (north/east velocity ∝ -sin(θ), cos(θ))
+  final northVel = -math.sin(s.gpsCircleTheta);
+  final eastVel = math.cos(s.gpsCircleTheta);
+  var cogDeg = math.atan2(eastVel, northVel) * 180 / math.pi;
+  if (cogDeg < 0) cogDeg += 360;
+
+  s.gpsHeadingCd = (cogDeg * 100).round() % 36000;
+  s.gpsSpeedCms = (gpsCircleSpeedMs * 100).round(); // cm/s
+  s.yawRad = cogDeg * math.pi / 180;
+}
+
 void _sendGpsRawInt() {
   final vehTime = _vehicleTimeUtc();
   final s = _state;
 
   final gps = GpsRawInt(
     timeUsec: BigInt.from(vehTime.microsecondsSinceEpoch),
-    lat: homeLat,
-    lon: homeLon,
+    lat: s.gpsLatE7,
+    lon: s.gpsLonE7,
     alt: s.gpsAltMm,
     eph: 120,
     epv: 65535,
     vel: s.gpsSpeedCms,
     cog: s.gpsHeadingCd,
-    fixType: 2, // 3D fix
+    fixType: 3, // 3D fix
     satellitesVisible: 14,
   );
 
-  _send(gps);
+  final sent = _send(gps);
+  print(
+    '[GPS] lat=${s.gpsLatE7 / 1e7} lon=${s.gpsLonE7 / 1e7} '
+    'cog=${s.gpsHeadingCd / 100}° vel=${s.gpsSpeedCms / 100} m/s → $sent bytes',
+  );
 }
 
 void _sendAttitude() {
@@ -428,59 +452,6 @@ void _sendAttitude() {
   );
 
   _send(att);
-}
-
-void _sendRadioStatus() {
-  if (!_radioSimulator.isStreaming) return;
-
-  final sample = _radioSimulator.nextSample();
-  _radioHttpServer.lastSample = sample;
-
-  final radio = RadioStatus(
-    rxerrors: 0,
-    fixed: 0,
-    rssi: sample.mavlinkRssi,
-    remrssi: sample.mavlinkRemRssi,
-    txbuf: 100,
-    noise: sample.mavlinkNoise,
-    remnoise: sample.mavlinkRemNoise,
-  );
-
-  final sent = _send(radio);
-  print(
-    '[RADIO_STATUS] rssi=${sample.antenna1Dbm}dBm '
-    'rem=${sample.antenna2Dbm}dBm noise=${sample.noiseDbm}dBm → $sent bytes',
-  );
-}
-
-void _applyRadioStateToUgv() {
-  final s = _state;
-  switch (_radioSimulator.state) {
-    case RadioSimulationState.normal:
-      s.lBandRadioState = 2;
-      s.lBandConnection = linkConnected;
-      s.lBandLinkHealth = linkHealthy;
-      s.lBandSensorFaults = 0;
-      s.lBandPower = pwrOn;
-    case RadioSimulationState.warning:
-      s.lBandRadioState = 2;
-      s.lBandConnection = linkConnected;
-      s.lBandLinkHealth = linkDegraded;
-      s.lBandSensorFaults = (1 << 2) | (1 << 6); // RSSI + local RSSI health
-      s.lBandPower = pwrOn;
-    case RadioSimulationState.critical:
-      s.lBandRadioState = icdFaulty;
-      s.lBandConnection = linkConnected;
-      s.lBandLinkHealth = 3; // Faulty
-      s.lBandSensorFaults = 0x1F; // multiple L-band fault bits
-      s.lBandPower = pwrOn;
-    case RadioSimulationState.disconnected:
-      s.lBandRadioState = icdUnknown;
-      s.lBandConnection = 2; // Disconnected
-      s.lBandLinkHealth = icdUnknown;
-      s.lBandSensorFaults = 1 << 4; // heartbeat fault
-      s.lBandPower = pwrOff;
-  }
 }
 
 DateTime _vehicleTimeUtc() {
@@ -617,8 +588,8 @@ UgvSystemInfo _buildUgvSystemInfo() {
     compInterfaceHealth1: s.compInterfaceHealth1,
     compInterfaceHealth2: s.compInterfaceHealth2,
     homeLocation: homeLocation,
-    lat: s.homeSet ? homeLat : 0,
-    lon: s.homeSet ? homeLon : 0,
+    lat: s.homeSet ? s.gpsLatE7 : 0,
+    lon: s.homeSet ? s.gpsLonE7 : 0,
   );
 }
 
@@ -696,7 +667,7 @@ void _tickUgvSystemInfo() {
   s.headlights = pwrOn;
   s.aftLights = pwrOn;
   s.fogLights = pwrOff;
-  s.gpsSpeedCms = 0;
+  // gpsSpeedCms / lat-lon are owned by _tickGpsMotion (continuous circle)
   s.rollSpeedRad = 0.0;
 
   // Slowly drain batteries
@@ -725,7 +696,6 @@ void _tickUgvSystemInfo() {
     s.vcuOpState = vcuKeyOn;
     s.chargerConnected = 1;
     s.charging = 1;
-    s.gpsSpeedCms = 150;
   } else {
     s.autonomyMode = 1;
     s.holdState = 1;
@@ -766,8 +736,6 @@ void _tickUgvSystemInfo() {
     s.fogLights = pwrOn;
     s.cameraHealthWord = 0x55A5; // port camera faulty
   }
-
-  _applyRadioStateToUgv();
 }
 
 // ── Bit-field helpers ─────────────────────────────────────────────────────

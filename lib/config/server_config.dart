@@ -27,7 +27,12 @@ class ServerConfig {
   static const String gcsRadioIp = '192.168.168.153';
 
   static const int udpStreamingPort = 9000;
-  static const int udpReportTimeMs = 1000;
+
+  /// RSSI report period default (ms). Manual §3.12: default 10, range 10–1000.
+  static const int udpReportTimeMs = 10;
+  static const int rssiReportPeriodMinMs = 10;
+  static const int rssiReportPeriodMaxMs = 1000;
+
   static const int udpTemperatureReportPeriodSec = 1;
   static const int tempReportingMinThresholdC = 70;
   static const int tempReportingMaxThresholdC = 85;
@@ -36,5 +41,6 @@ class ServerConfig {
   static const String radioHttpBindHost = '0.0.0.0';
   static const int radioHttpPort = 80;
 
-  static const int radioNodeId = 1;
+  /// Default node id when not using §5 Table 2 sample (sample uses 1025).
+  static const int radioNodeId = 1025;
 }

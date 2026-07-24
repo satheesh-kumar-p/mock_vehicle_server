@@ -36,15 +36,15 @@ class RadioMetricTargets {
     required this.overheatCount,
   });
 
-  /// All metrics within healthy bands (green).
+  /// §5 Table 2 sample values (manual exact RSSI example).
   static const normal = RadioMetricTargets(
-    antenna1Dbm: -75,
-    antenna2Dbm: -76,
-    antenna3Dbm: -77,
-    antenna4Dbm: -78,
-    noiseDbm: -95,
-    syncSignal: 180,
-    syncNoise: 120,
+    antenna1Dbm: -43,
+    antenna2Dbm: -31,
+    antenna3Dbm: -28,
+    antenna4Dbm: -66,
+    noiseDbm: -190,
+    syncSignal: 8604568,
+    syncNoise: 8861322,
     temperatureCelsius: 45,
     maxTemperatureCelsius: 55,
     overheatCount: 0,

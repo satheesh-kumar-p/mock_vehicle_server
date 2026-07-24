@@ -1,17 +1,61 @@
 # mock_vehicle_server
 
-Standalone mock MAVLink vehicle UDP server for GCS testing
+Standalone mock servers for GCS testing:
 
-## Getting Started
+- **Vehicle** — MAVLink UDP telemetry / commands
+- **Radio** — Silvus StreamScape HTTP API + TLV UDP RSSI/temperature reports (§§5–6)
 
-This project is a starting point for a Flutter application.
+They run independently so you can exercise radio UI without the vehicle mock (or vice versa).
 
-A few resources to get you started if this is your first Flutter project:
+## Run vehicle mock
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```bash
+dart run bin/mock_vehicle_server.dart
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Listens on UDP `7000`, sends to GCS on `7500` (see `lib/config/server_config.dart`).
+
+## Run radio mock (independent)
+
+```bash
+# Default: exact §5 Table 2 RSSI TLV (109 bytes) + §6 temperature framing
+dart run bin/mock_radio_server.dart
+
+# Dynamic threshold bands instead of Table 2
+dart run bin/mock_radio_server.dart --dynamic --state=warning
+
+# No-traffic keepalive (all RSSI fields 999)
+dart run bin/mock_radio_server.dart --keepalive
+
+dart run bin/mock_radio_server.dart --auto-cycle=30
+```
+
+| Endpoint | Purpose |
+|----------|---------|
+| `http://<gcsRadioIp>:80/streamscape_api` | Silvus JSON-RPC (RSSI/temp reporting config) |
+| `GET/POST http://0.0.0.0:80/control/radio-state` | Force state / keepalive / manual-sample flags |
+
+Enable RSSI streaming (required before UDP RSSI reports):
+
+```bash
+curl -X POST -d '{"jsonrpc":"2.0","method":"rssi_report_enable","params":["1"],"id":1}' \
+  http://192.168.168.153/streamscape_api
+```
+
+TLV reports default to `gcsHostSystemIp:udpStreamingPort` from `ServerConfig`.
+
+## Layout
+
+```
+bin/mock_vehicle_server.dart   # MAVLink vehicle only
+bin/mock_radio_server.dart     # Silvus radio only (§§5–6)
+lib/radio/                     # Radio simulation stack
+  radio_mock_server.dart       # Facade used by the radio entrypoint
+  radio_simulator.dart
+  radio_http_server.dart
+  radio_udp_streamer.dart
+  radio_tlv_encoder.dart       # Null-terminated TLV per §4
+  radio_thresholds.dart
+lib/config/server_config.dart
+test/radio_tlv_encoder_test.dart
+```
