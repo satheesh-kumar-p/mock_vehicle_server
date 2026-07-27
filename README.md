@@ -18,6 +18,20 @@ Listens on UDP `7000`, sends to GCS on `7500` (see `lib/config/server_config.dar
 On start it also launches a GStreamer H.264 RTP test pattern to `udp://127.0.0.1:5000`
 (`gst-launch-1.0` must be on `PATH`).
 
+**GCS must use the mock network profile** or commands never reach this process:
+
+```dart
+// scout-td0-GCS/lib/core/constants/app_constants.dart
+static const AppNetworkProfile profile = AppNetworkProfile.mock;
+```
+
+| Direction | Mock profile | Production profile |
+|-----------|--------------|--------------------|
+| GCS → vehicle | `127.0.0.1:7000` | `192.168.168.98:7000` |
+| Vehicle → GCS | `127.0.0.1:7500` | bind `0.0.0.0:7500` |
+
+With production selected, telemetry can still appear (mock → localhost:7500) while SET_HOME / other commands go to the real vehicle IP and never hit the mock.
+
 ## Run radio mock (independent)
 
 ```bash

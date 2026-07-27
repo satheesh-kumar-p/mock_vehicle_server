@@ -39,13 +39,13 @@ const int cmdLightControl = 31901;
 const int cmdCameraMarker = 31902;
 const int cmdRemoteEmergency = 31904;
 
-// Bangalore map center — fixed GPS orbit center (independent of SET_HOME)
+// Bangalore map center — fixed GPS path center (independent of SET_HOME)
 const int orbitLat = 130828500; // 13.08285°
 const int orbitLon = 776234500; // 77.62345°
 
-// Continuous circle for marker-animation testing
-const double gpsCircleRadiusM = 500.0;
-const double gpsCircleSpeedMs = 1.5; // ~1.5 m/s
+// Slow square path — small enough to stay on one map screen for SET_HOME testing
+const double gpsSquareHalfSideM = 25.0; // 50 m × 50 m square
+const double gpsSquareSpeedMs = 0.25; // ~0.25 m/s (~13 min per lap)
 const double metersPerDegLat = 111320.0;
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -57,6 +57,8 @@ late DateTime _bootTime;
 late final MavlinkParser _parser;
 late final MavlinkSignatureManager _signatureManager;
 Process? _gstreamerProcess;
+final List<Timer> _timers = [];
+var _shuttingDown = false;
 
 // ── ICD encodings (COMP_UGV_STATUS / UGV_SYSTEM_INFO v1.3) ───────────────
 
@@ -182,16 +184,16 @@ class _MockUgvState {
   // Camera health in sensor_subsystem_health_4: 1=Healthy per 2-bit field
   int cameraHealthWord = 0x5555;
 
-  // GNSS / attitude simulation (orbits fixed [orbitLat]/[orbitLon], not home)
+  // GNSS / attitude simulation (square path around [orbitLat]/[orbitLon], not home)
   int gpsLatE7 = orbitLat;
   int gpsLonE7 = orbitLon;
-  double gpsCircleTheta = 0.0; // rad; angle on circle around orbit center
+  double gpsPathDistanceM = 0.0; // meters traveled along square perimeter
   int gpsAltMm = 920000; // 920 m MSL
-  int gpsHeadingCd = 4500; // 45.00°
-  int gpsSpeedCms = 150; // 1.50 m/s while circling
+  int gpsHeadingCd = 9000; // 90.00° (east, first square side)
+  int gpsSpeedCms = 25; // 0.25 m/s while traversing square
   double rollRad = 0.02;
   double pitchRad = -0.01;
-  double yawRad = 0.78;
+  double yawRad = math.pi / 2;
   double rollSpeedRad = 0.0;
 }
 
@@ -203,7 +205,8 @@ Future<void> main() async {
     MavlinkSignatureConfig(
       secretKey: _mavlinkSecretKey,
       linkId: mavlinkLinkId,
-      acceptPolicy: SignatureAcceptPolicy.acceptUnsigned,
+      // Match GCS acceptAll so signed COMMAND_LONG (SET_HOME) is never dropped.
+      acceptPolicy: SignatureAcceptPolicy.acceptAll,
     ),
   );
   _parser = MavlinkParser(
@@ -239,13 +242,13 @@ Future<void> main() async {
     _parser.parse(dg.data);
   });
 
-  Timer.periodic(const Duration(seconds: 1), (_) {
+  _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
     _tickCount++;
     _sendCompHeartbeat();
     _sendSystemTime();
-  });
+  }));
 
-  Timer.periodic(const Duration(seconds: 1), (_) {
+  _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
     _tickUgvSystemInfo();
     final ugv = _buildUgvSystemInfo();
     final sent = _send(ugv);
@@ -255,22 +258,25 @@ Future<void> main() async {
       '${s.homeSet ? ' home=${s.homeLatE7},${s.homeLonE7}' : ' home=unset'}'
       ' gps=${s.gpsLatE7},${s.gpsLonE7}',
     );
-  });
+  }));
 
-  Timer.periodic(const Duration(seconds: 1), (_) {
+  _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
     _tickGpsMotion();
     _sendGpsRawInt();
     _sendAttitude();
-  });
+  }));
 
   print('\nServer running. Press Ctrl+C to stop.\n');
 
-  // Keep process alive until SIGINT/SIGTERM, then tear down GStreamer.
   final stop = Completer<void>();
   void requestStop(ProcessSignal signal) {
-    if (stop.isCompleted) return;
+    if (_shuttingDown) {
+      print('\n[$signal] Force exit');
+      exit(1);
+    }
+    _shuttingDown = true;
     print('\n[$signal] Shutting down…');
-    stop.complete();
+    if (!stop.isCompleted) stop.complete();
   }
 
   ProcessSignal.sigint.watch().listen(requestStop);
@@ -279,14 +285,27 @@ Future<void> main() async {
   }
 
   await stop.future;
+  await _shutdown();
+}
+
+Future<void> _shutdown() async {
+  for (final t in _timers) {
+    t.cancel();
+  }
+  _timers.clear();
+  try {
+    _socket.close();
+  } catch (_) {}
   await _stopGstreamerVideo();
+  print('Stopped.');
+  exit(0);
 }
 
 Future<void> _startGstreamerVideo() async {
   final host = ServerConfig.videoStreamHost;
   final port = ServerConfig.videoStreamPort;
+  // No -v: verbose gst output can fill pipes and stall the process group.
   final args = <String>[
-    '-v',
     'videotestsrc',
     'is-live=true',
     'pattern=ball',
@@ -310,16 +329,18 @@ Future<void> _startGstreamerVideo() async {
   ];
 
   try {
-    final process = await Process.start('gst-launch-1.0', args);
+    final process = await Process.start(
+      'gst-launch-1.0',
+      args,
+      // Keep child out of the terminal process group so Ctrl+C hits Dart only.
+      mode: ProcessStartMode.normal,
+    );
     _gstreamerProcess = process;
     print('[GST] H.264 RTP test pattern → udp://$host:$port (pid=${process.pid})');
 
-    process.stdout
-        .transform(const SystemEncoding().decoder)
-        .listen((line) => stdout.write('[GST] $line'));
-    process.stderr
-        .transform(const SystemEncoding().decoder)
-        .listen((line) => stderr.write('[GST] $line'));
+    // Drain pipes so gst never blocks on a full stdout/stderr buffer.
+    process.stdout.drain<void>();
+    process.stderr.drain<void>();
     process.exitCode.then((code) {
       if (identical(_gstreamerProcess, process)) {
         _gstreamerProcess = null;
@@ -339,11 +360,11 @@ Future<void> _stopGstreamerVideo() async {
   if (process == null) return;
   _gstreamerProcess = null;
   print('[GST] Stopping pid=${process.pid}');
-  process.kill(ProcessSignal.sigint);
+  process.kill(ProcessSignal.sigkill);
   try {
-    await process.exitCode.timeout(const Duration(seconds: 2));
+    await process.exitCode.timeout(const Duration(milliseconds: 500));
   } on TimeoutException {
-    process.kill(ProcessSignal.sigkill);
+    // already killed
   }
 }
 
@@ -389,9 +410,15 @@ void _respondToTimesync(Timesync request) {
 }
 
 void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
+  print(
+    '[RX] COMMAND_LONG cmd=${cmd.command} p1=${cmd.param1} '
+    'target=${cmd.targetSystem}/${cmd.targetComponent} '
+    'from ${frame.systemId}/${frame.componentId}',
+  );
+
   if (cmd.targetSystem != vehicleSysId || cmd.targetComponent != vehicleCompId) {
     print(
-      '[RX] COMMAND_LONG ignored — target ${cmd.targetSystem}/${cmd.targetComponent}',
+      '[RX] COMMAND_LONG ignored — want $vehicleSysId/$vehicleCompId',
     );
     return;
   }
@@ -441,24 +468,22 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
         print(
           '[CMD] SET_HOME latched GPS_RAW_INT → '
           'lat=${s.homeLatE7} lon=${s.homeLonE7} '
-          '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7})',
+          '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7}) '
+          'flag=${s.homeSet}',
         );
         // Push UGV_SYSTEM_INFO immediately so GCS sees the latch
         // before the next GPS motion tick.
         final ugv = _buildUgvSystemInfo();
         final sent = _send(ugv);
         print(
-          '[UGV] SET_HOME status → home lat=${ugv.lat} lon=${ugv.lon} '
-          '($sent bytes)',
+          '[UGV] SET_HOME status → homeLocation=${ugv.homeLocation} '
+          'lat=${ugv.lat} lon=${ugv.lon} ($sent bytes)',
         );
       } else {
         print('[CMD] SET_HOME ignored — param1=$p1 (need 1)');
       }
     default:
-      print(
-        '[RX] COMMAND_LONG cmd=${cmd.command} from '
-        '${frame.systemId}/${frame.componentId}',
-      );
+      print('[RX] COMMAND_LONG unhandled cmd=${cmd.command}');
   }
 }
 
@@ -492,36 +517,54 @@ void _sendSystemTime() {
   );
 }
 
-/// Advance circular GPS position + COG at 1 Hz around fixed [orbitLat]/[orbitLon].
-/// Home (SET_HOME) is independent — latching home must not move the GPS orbit.
+/// Advance square GPS path + COG at 1 Hz around fixed [orbitLat]/[orbitLon].
+/// Home (SET_HOME) is independent — latching home must not move the GPS path.
 void _tickGpsMotion() {
   final s = _state;
-  final omega = gpsCircleSpeedMs / gpsCircleRadiusM; // rad/s at 1 Hz ticks
-  s.gpsCircleTheta = (s.gpsCircleTheta + omega) % (2 * math.pi);
+  final half = gpsSquareHalfSideM;
+  final sideLen = 2 * half;
+  final perimeter = 4 * sideLen;
+
+  s.gpsPathDistanceM = (s.gpsPathDistanceM + gpsSquareSpeedMs) % perimeter;
+
+  // Sides CCW from NW corner: east → south → west → north
+  final side = (s.gpsPathDistanceM / sideLen).floor();
+  final along = s.gpsPathDistanceM - side * sideLen;
+
+  late final double northM;
+  late final double eastM;
+  late final double cogDeg;
+  switch (side) {
+    case 0: // north edge, west → east
+      northM = half;
+      eastM = -half + along;
+      cogDeg = 90;
+    case 1: // east edge, north → south
+      northM = half - along;
+      eastM = half;
+      cogDeg = 180;
+    case 2: // south edge, east → west
+      northM = -half;
+      eastM = half - along;
+      cogDeg = 270;
+    default: // west edge, south → north
+      northM = -half + along;
+      eastM = -half;
+      cogDeg = 0;
+  }
 
   final orbitLatDeg = orbitLat / 1e7;
   final orbitLonDeg = orbitLon / 1e7;
   final metersPerDegLon =
       metersPerDegLat * math.cos(orbitLatDeg * math.pi / 180);
 
-  // Offset from center: north = r·cos(θ), east = r·sin(θ)
-  final northM = gpsCircleRadiusM * math.cos(s.gpsCircleTheta);
-  final eastM = gpsCircleRadiusM * math.sin(s.gpsCircleTheta);
-
   final latDeg = orbitLatDeg + northM / metersPerDegLat;
   final lonDeg = orbitLonDeg + eastM / metersPerDegLon;
 
   s.gpsLatE7 = (latDeg * 1e7).round();
   s.gpsLonE7 = (lonDeg * 1e7).round();
-
-  // Tangent COG for CCW motion (north/east velocity ∝ -sin(θ), cos(θ))
-  final northVel = -math.sin(s.gpsCircleTheta);
-  final eastVel = math.cos(s.gpsCircleTheta);
-  var cogDeg = math.atan2(eastVel, northVel) * 180 / math.pi;
-  if (cogDeg < 0) cogDeg += 360;
-
   s.gpsHeadingCd = (cogDeg * 100).round() % 36000;
-  s.gpsSpeedCms = (gpsCircleSpeedMs * 100).round(); // cm/s
+  s.gpsSpeedCms = (gpsSquareSpeedMs * 100).round(); // cm/s
   s.yawRad = cogDeg * math.pi / 180;
 }
 
@@ -779,7 +822,7 @@ void _tickUgvSystemInfo() {
   s.headlights = pwrOn;
   s.aftLights = pwrOn;
   s.fogLights = pwrOff;
-  // gpsSpeedCms / lat-lon are owned by _tickGpsMotion (continuous circle)
+  // gpsSpeedCms / lat-lon are owned by _tickGpsMotion (slow square path)
   s.rollSpeedRad = 0.0;
 
   // Slowly drain batteries
