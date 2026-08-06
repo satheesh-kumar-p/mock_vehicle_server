@@ -15,10 +15,8 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  mavlink_dart:
-    git:
-      url: https://github.com/satheesh-kumar-p/mavlink_dart
-      ref: v0.0.5-alpha.1
+  scout_mavlink_dart:
+    path: ../scout-td0-mavlink-data-model-generator/packages/scout_mavlink_dart
 
 dev_dependencies:
   flutter_test:

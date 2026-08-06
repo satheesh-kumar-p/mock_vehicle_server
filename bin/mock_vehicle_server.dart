@@ -1,13 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:mock_vehicle_server/config/server_config.dart';
-import 'package:mavlink_dart/dialects/ugvcustom.dart';
-import 'package:mavlink_dart/mavlink_frame.dart';
-import 'package:mavlink_dart/mavlink_parser.dart';
-import 'package:mavlink_dart/mavlink_signature.dart';
+import 'package:scout_mavlink_dart/scout_mavlink_dart.dart';
 
 // ── CONFIG (mirrors scout-td0-GCS RadioConfig in app_constants.dart) ─────
 // Silvus radio mock runs separately: dart run bin/mock_radio_server.dart
@@ -30,13 +28,15 @@ final Uint8List _mavlinkSecretKey = Uint8List.fromList([
   0x40, 0xed, 0x99, 0x13, 0xab, 0x5c, 0xe2, 0x04,
 ]);
 
-// MAV_CMD values from ICD / ugvcustom.xml
+// MAV_CMD values from ICD v1.4 / ugvcustom.xml
 const int cmdSetMode = 176;
 const int cmdArmDisarm = 400;
 const int cmdSetHome = 179;
+const int cmdRth = 20;
 const int cmdDriveMode = 31900;
 const int cmdLightControl = 31901;
 const int cmdCameraMarker = 31902;
+const int cmdOverrideSafety = 31903;
 const int cmdRemoteEmergency = 31904;
 
 // Bangalore map center — fixed GPS path center (independent of SET_HOME)
@@ -46,6 +46,7 @@ const int orbitLon = 776234500; // 77.62345°
 // Slow square path — small enough to stay on one map screen for SET_HOME testing
 const double gpsSquareHalfSideM = 25.0; // 50 m × 50 m square
 const double gpsSquareSpeedMs = 0.25; // ~0.25 m/s (~13 min per lap)
+const double gpsTickSeconds = 0.1; // ICD 5.1.7.2.3 / .4: GPS + ATT at 10 Hz
 const double metersPerDegLat = 111320.0;
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -59,6 +60,10 @@ late final MavlinkSignatureManager _signatureManager;
 Process? _gstreamerProcess;
 final List<Timer> _timers = [];
 var _shuttingDown = false;
+
+/// High-rate messages (GPS/ATT at 10 Hz, MANUAL_CONTROL while driving) log at most 1 Hz.
+const Duration _highRateLogInterval = Duration(seconds: 1);
+final Map<Type, DateTime> _lastHighRateLogAt = {};
 
 // ── ICD encodings (COMP_UGV_STATUS / UGV_SYSTEM_INFO v1.3) ───────────────
 
@@ -82,6 +87,90 @@ const int linkConnected = 1;
 // Link health: 1=Healthy, 2=Degraded, 3=Faulty
 const int linkHealthy = 1;
 const int linkDegraded = 2;
+
+/// Polaris Connect Flow health outcomes for GCS Battery/Motor/Sensor POST.
+enum HealthScenario {
+  /// All battery / motor / sensor fields healthy (Figma Success_Health_Check).
+  success,
+
+  /// Motor group faulty only (Figma Error_Health_Check partial).
+  partial,
+
+  /// Battery + motor + sensor all faulty (Figma Error_Health_Check complete).
+  failure,
+
+  /// Legacy 30 s rotating fault / mode phases.
+  cycle,
+}
+
+HealthScenario _healthScenario = HealthScenario.success;
+
+HealthScenario? _parseHealthScenario(String raw) {
+  switch (raw.trim().toLowerCase()) {
+    case 'success':
+      return HealthScenario.success;
+    case 'partial':
+      return HealthScenario.partial;
+    case 'failure':
+    case 'fail':
+    case 'complete':
+      return HealthScenario.failure;
+    case 'cycle':
+      return HealthScenario.cycle;
+    default:
+      return null;
+  }
+}
+
+void _printUsage() {
+  stdout.writeln('''
+Usage: dart run bin/mock_vehicle_server.dart [options]
+
+Options:
+  --state=success|partial|failure|cycle
+      Lock UGV_SYSTEM_INFO health to a Polaris Connect Flow scenario.
+      Default: success
+
+  -h, --help
+      Show this help.
+
+Scenarios (GCS Battery / Motor / Sensor POST rows):
+  success   all pass  → "Connection Successful! …"
+  partial   motor fail only → "Error Detected…"
+  failure   all fail  → "Error Detected…"
+  cycle     rotate faults every 30 s (legacy)
+''');
+}
+
+HealthScenario? _parseArgs(List<String> args) {
+  var scenario = HealthScenario.success;
+
+  for (final arg in args) {
+    if (arg == '--help' || arg == '-h') {
+      _printUsage();
+      return null;
+    }
+
+    if (arg.startsWith('--state=')) {
+      final parsed = _parseHealthScenario(arg.substring('--state='.length));
+      if (parsed == null) {
+        stderr.writeln(
+          'Unknown --state value. Use success|partial|failure|cycle.',
+        );
+        _printUsage();
+        return null;
+      }
+      scenario = parsed;
+      continue;
+    }
+
+    stderr.writeln('Unknown argument: $arg');
+    _printUsage();
+    return null;
+  }
+
+  return scenario;
+}
 
 // ── Mock UGV state (updated each tick / by commands) ─────────────────────
 class _MockUgvState {
@@ -199,7 +288,13 @@ class _MockUgvState {
 
 final _state = _MockUgvState();
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
+  final scenario = _parseArgs(args);
+  if (scenario == null) {
+    exit(64);
+  }
+  _healthScenario = scenario;
+
   _bootTime = DateTime.now();
   _signatureManager = MavlinkSignatureManager(
     MavlinkSignatureConfig(
@@ -230,6 +325,7 @@ Future<void> main() async {
     '║ Video RTP       : ${ServerConfig.videoStreamHost}:'
     '${ServerConfig.videoStreamPort}║',
   );
+  print('║ Health scenario : ${_healthScenario.name}║');
   print('╚══════════════════════════════════════╝');
   print('Silvus radio: dart run bin/mock_radio_server.dart');
 
@@ -243,24 +339,19 @@ Future<void> main() async {
   });
 
   _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
-    _tickCount++;
     _sendCompHeartbeat();
-    _sendSystemTime();
   }));
 
   _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
     _tickUgvSystemInfo();
-    final ugv = _buildUgvSystemInfo();
-    final sent = _send(ugv);
-    final s = _state;
-    print(
-      '[UGV] sent → $sent bytes'
-      '${s.homeSet ? ' home=${s.homeLatE7},${s.homeLonE7}' : ' home=unset'}'
-      ' gps=${s.gpsLatE7},${s.gpsLonE7}',
-    );
+    _send(_buildUgvSystemInfo());
   }));
 
-  _timers.add(Timer.periodic(const Duration(seconds: 1), (_) {
+  // ICD 5.1.7.2.2: COMP_SYSTEM_TIME is one-time at startup.
+  _sendSystemTime();
+
+  // ICD 5.1.7.2.3 / 5.1.7.2.4: GPS_RAW_INT + ATTITUDE at 10 Hz.
+  _timers.add(Timer.periodic(const Duration(milliseconds: 100), (_) {
     _tickGpsMotion();
     _sendGpsRawInt();
     _sendAttitude();
@@ -370,9 +461,15 @@ Future<void> _stopGstreamerVideo() async {
 
 void _handleIncomingFrame(MavlinkFrame frame) {
   final msg = frame.message;
+  _logMavlink(
+    direction: 'RX',
+    message: msg,
+    systemId: frame.systemId,
+    componentId: frame.componentId,
+    sequence: frame.sequence,
+  );
 
   if (msg is Heartbeat) {
-    print('[RX] GCS heartbeat — sysId=${frame.systemId} comp=${frame.componentId}');
     return;
   }
 
@@ -387,16 +484,15 @@ void _handleIncomingFrame(MavlinkFrame frame) {
   }
 
   if (msg is ManualControl) {
-    print('[RX] MANUAL_CONTROL x=${msg.x} y=${msg.y}');
     return;
   }
 
-  print('[RX] Unhandled message: ${msg.runtimeType}');
+  print('[RX] Unhandled message type: ${msg.runtimeType}');
 }
 
 void _respondToTimesync(Timesync request) {
   final vehTime = _vehicleTimeUtc();
-  final tc1 = vehTime.microsecondsSinceEpoch;
+  final tc1 = vehTime.microsecondsSinceEpoch * 1000;
 
   final response = Timesync(
     ts1: request.ts1,
@@ -405,20 +501,14 @@ void _respondToTimesync(Timesync request) {
     targetComponent: gcsCompId,
   );
 
-  final sent = _send(response);
-  print('[TS] Response sent tc1=$tc1 us → $sent bytes');
+  _send(response);
 }
 
 void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
-  print(
-    '[RX] COMMAND_LONG cmd=${cmd.command} p1=${cmd.param1} '
-    'target=${cmd.targetSystem}/${cmd.targetComponent} '
-    'from ${frame.systemId}/${frame.componentId}',
-  );
-
   if (cmd.targetSystem != vehicleSysId || cmd.targetComponent != vehicleCompId) {
     print(
-      '[RX] COMMAND_LONG ignored — want $vehicleSysId/$vehicleCompId',
+      '[CMD] ignored — want $vehicleSysId/$vehicleCompId '
+      '(got ${cmd.targetSystem}/${cmd.targetComponent})',
     );
     return;
   }
@@ -468,53 +558,47 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
         print(
           '[CMD] SET_HOME latched GPS_RAW_INT → '
           'lat=${s.homeLatE7} lon=${s.homeLonE7} '
-          '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7}) '
-          'flag=${s.homeSet}',
+          '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7})',
         );
         // Push UGV_SYSTEM_INFO immediately so GCS sees the latch
         // before the next GPS motion tick.
-        final ugv = _buildUgvSystemInfo();
-        final sent = _send(ugv);
-        print(
-          '[UGV] SET_HOME status → homeLocation=${ugv.homeLocation} '
-          'lat=${ugv.lat} lon=${ugv.lon} ($sent bytes)',
-        );
+        _send(_buildUgvSystemInfo());
       } else {
         print('[CMD] SET_HOME ignored — param1=$p1 (need 1)');
       }
+    case cmdOverrideSafety:
+      // ICD 5.1.6.2.13: enter arm override mode
+      s.armMode = 3;
+      print('[CMD] OVERRIDE_SAFETY armMode=3 (Override)');
+    case cmdRth:
+      // ICD 5.1.6.2.14: accept RTH (no mission engine in mock)
+      print('[CMD] RTH accepted (no path following in mock)');
     default:
-      print('[RX] COMMAND_LONG unhandled cmd=${cmd.command}');
+      print('[CMD] unhandled cmd=${cmd.command}');
   }
 }
 
 void _sendCompHeartbeat() {
   // COMP_HEARTBEAT to GCS (ICD 5.1.6.2.1): base_mode=0, custom_mode=0
-  final hb = Heartbeat(
+  _tickCount++;
+  _send(Heartbeat(
     type: 18,
     autopilot: 8,
     baseMode: 0,
     customMode: 0,
     systemStatus: 4,
     mavlinkVersion: 3,
-  );
-
-  final sent = _send(hb);
-  print('[HB] tick=$_tickCount → $sent bytes');
+  ));
 }
 
 void _sendSystemTime() {
   final vehTime = _vehicleTimeUtc();
   final bootMs = DateTime.now().difference(_bootTime).inMilliseconds;
 
-  final st = SystemTime(
+  _send(SystemTime(
     timeUnixUsec: BigInt.from(vehTime.microsecondsSinceEpoch),
     timeBootMs: bootMs,
-  );
-
-  final sent = _send(st);
-  print(
-    '[ST] one-time boot=${bootMs}ms unix=${vehTime.microsecondsSinceEpoch} → $sent bytes',
-  );
+  ));
 }
 
 /// Advance square GPS path + COG at 1 Hz around fixed [orbitLat]/[orbitLon].
@@ -525,7 +609,8 @@ void _tickGpsMotion() {
   final sideLen = 2 * half;
   final perimeter = 4 * sideLen;
 
-  s.gpsPathDistanceM = (s.gpsPathDistanceM + gpsSquareSpeedMs) % perimeter;
+  s.gpsPathDistanceM =
+      (s.gpsPathDistanceM + gpsSquareSpeedMs * gpsTickSeconds) % perimeter;
 
   // Sides CCW from NW corner: east → south → west → north
   final side = (s.gpsPathDistanceM / sideLen).floor();
@@ -572,7 +657,7 @@ void _sendGpsRawInt() {
   final vehTime = _vehicleTimeUtc();
   final s = _state;
 
-  final gps = GpsRawInt(
+  _send(GpsRawInt(
     timeUsec: BigInt.from(vehTime.microsecondsSinceEpoch),
     lat: s.gpsLatE7,
     lon: s.gpsLonE7,
@@ -583,20 +668,14 @@ void _sendGpsRawInt() {
     cog: s.gpsHeadingCd,
     fixType: 3, // 3D fix
     satellitesVisible: 14,
-  );
-
-  final sent = _send(gps);
-  print(
-    '[GPS] lat=${s.gpsLatE7 / 1e7} lon=${s.gpsLonE7 / 1e7} '
-    'cog=${s.gpsHeadingCd / 100}° vel=${s.gpsSpeedCms / 100} m/s → $sent bytes',
-  );
+  ));
 }
 
 void _sendAttitude() {
   final bootMs = DateTime.now().difference(_bootTime).inMilliseconds;
   final s = _state;
 
-  final att = Attitude(
+  _send(Attitude(
     timeBootMs: bootMs,
     roll: s.rollRad,
     pitch: s.pitchRad,
@@ -604,9 +683,7 @@ void _sendAttitude() {
     rollspeed: s.rollSpeedRad,
     pitchspeed: 0,
     yawspeed: 0,
-  );
-
-  _send(att);
+  ));
 }
 
 DateTime _vehicleTimeUtc() {
@@ -615,7 +692,7 @@ DateTime _vehicleTimeUtc() {
   );
 }
 
-// ── Build UGV_SYSTEM_INFO per ICD v1.3 + ugvcustom.xml ────────────────────
+// ── Build UGV_SYSTEM_INFO per ICD v1.4 + ugvcustom.xml ────────────────────
 UgvSystemInfo _buildUgvSystemInfo() {
   final s = _state;
 
@@ -674,9 +751,10 @@ UgvSystemInfo _buildUgvSystemInfo() {
     [2, 2, 2, 2, 2, 2, 2],
   );
 
+  // ICD sensor_subsystem_health_2: UHF connection, UHF link health, RGBD camera
   final sensorSubsystemHealth2 = _packFields(
-    [s.uhfConnection, s.uhfLinkHealth],
-    [2, 2],
+    [s.uhfConnection, s.uhfLinkHealth, icdHealthy],
+    [2, 2, 2],
   );
 
   final sensorSubsystemHealth3 = _packLBandHealth(
@@ -749,26 +827,80 @@ UgvSystemInfo _buildUgvSystemInfo() {
 }
 
 // ── Serialize + send ─────────────────────────────────────────────────────
-int _send(dynamic message) {
+bool _isHighRateMessage(MavlinkMessage message) {
+  return message is GpsRawInt ||
+      message is Attitude ||
+      message is ManualControl;
+}
+
+bool _shouldLogMessage(MavlinkMessage message) {
+  if (!_isHighRateMessage(message)) return true;
+  final now = DateTime.now();
+  final last = _lastHighRateLogAt[message.runtimeType];
+  if (last != null && now.difference(last) < _highRateLogInterval) {
+    return false;
+  }
+  _lastHighRateLogAt[message.runtimeType] = now;
+  return true;
+}
+
+String _formatMessageData(MavlinkMessage message) {
+  return jsonEncode(
+    message.toJson(),
+    toEncodable: (value) {
+      if (value is BigInt) return value.toString();
+      return value;
+    },
+  );
+}
+
+void _logMavlink({
+  required String direction,
+  required MavlinkMessage message,
+  required int systemId,
+  required int componentId,
+  required int sequence,
+  int? bytes,
+}) {
+  if (!_shouldLogMessage(message)) return;
+  final gated = _isHighRateMessage(message) ? ' (1Hz gated)' : '';
+  final size = bytes != null ? ' $bytes bytes' : '';
+  print(
+    '[$direction] ${message.runtimeType} id=${message.mavlinkMessageId} '
+    'seq=$sequence sys=$systemId/$componentId$size$gated '
+    '${_formatMessageData(message)}',
+  );
+}
+
+int _send(MavlinkMessage message) {
   try {
+    final seq = _sequence++ & 0xFF;
     final frame = MavlinkFrame.v2(
-      _sequence++ & 0xFF,
+      seq,
       vehicleSysId,
       vehicleCompId,
       message,
       signatureManager: _signatureManager,
     );
     final bytes = frame.serialize();
-    return _socket.send(bytes.buffer.asUint8List(), _gcsAddress, gcsPort);
+    final sent = _socket.send(bytes.buffer.asUint8List(), _gcsAddress, gcsPort);
+    _logMavlink(
+      direction: 'TX',
+      message: message,
+      systemId: vehicleSysId,
+      componentId: vehicleCompId,
+      sequence: seq,
+      bytes: sent,
+    );
+    return sent;
   } catch (e) {
     print('[ERR] Send failed: $e');
     return -1;
   }
 }
 
-// ── Mock state evolution (cycles through scenarios every 30 s) ────────────
+// ── Mock state evolution (health scenario + mild telemetry drift) ─────────
 void _tickUgvSystemInfo() {
-  final phase = _tickCount % 30;
   final s = _state;
 
   // Reset to healthy baseline
@@ -833,6 +965,67 @@ void _tickUgvSystemInfo() {
   s.yawRad = (s.yawRad + 0.002) % (2 * math.pi);
   s.rollRad = 0.02 * math.sin(_tickCount * 0.1);
   s.pitchRad = -0.01 * math.cos(_tickCount * 0.1);
+
+  if (_healthScenario == HealthScenario.cycle) {
+    _applyCycleScenario(s);
+  } else {
+    // Locked Polaris Connect scenarios: freeze mode/arm for predictable POST.
+    s.autonomyMode = 1;
+    s.holdState = 1;
+    s.armMode = 2;
+    s.driveLimit = 1;
+    s.driveMode = 1;
+    s.vcuOpState = vcuDrive;
+
+    switch (_healthScenario) {
+      case HealthScenario.success:
+        // Baseline already healthy.
+        break;
+      case HealthScenario.partial:
+        _applyPartialFailure(s);
+        break;
+      case HealthScenario.failure:
+        _applyCompleteFailure(s);
+        break;
+      case HealthScenario.cycle:
+        break;
+    }
+  }
+}
+
+/// Figma partial error: Battery ✓, Motor ✗, Sensor ✓.
+void _applyPartialFailure(_MockUgvState s) {
+  s.fwdLeftMotorHealth = icdFaulty;
+  s.motorFaults = _packMotorFaults(
+    aftPort: 0,
+    aftStbd: 0,
+    fwdPort: 0x20,
+    fwdStbd: 0,
+  );
+}
+
+/// Figma complete error: Battery ✗, Motor ✗, Sensor ✗.
+void _applyCompleteFailure(_MockUgvState s) {
+  s.hvBatteryHealth = icdFaulty;
+  s.hvBatteryFaults = 1 << 3;
+
+  s.fwdMcHealth = icdFaulty;
+  s.mcFaults1 = 1 << 3;
+  s.fwdLeftMotorHealth = icdFaulty;
+  s.motorFaults = _packMotorFaults(
+    aftPort: 0,
+    aftStbd: 0,
+    fwdPort: 0x20,
+    fwdStbd: 0,
+  );
+
+  s.gnssState = icdFaulty;
+  s.cameraHealthWord = 0x55A5; // port camera faulty
+}
+
+/// Legacy 30 s rotating mode + fault phases.
+void _applyCycleScenario(_MockUgvState s) {
+  final phase = _tickCount % 30;
 
   // ── Mode / arm cycling ───────────────────────────────────────────────
   if (phase < 10) {

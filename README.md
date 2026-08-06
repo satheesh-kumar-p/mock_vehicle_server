@@ -10,13 +10,33 @@ They run independently so you can exercise radio UI without the vehicle mock (or
 ## Run vehicle mock
 
 ```bash
+# Default: all health checks pass (Polaris Connect success)
 dart run bin/mock_vehicle_server.dart
+
+# Lock health to a Connect Flow POST outcome
+dart run bin/mock_vehicle_server.dart --state=success
+dart run bin/mock_vehicle_server.dart --state=partial
+dart run bin/mock_vehicle_server.dart --state=failure
+
+# Legacy rotating faults / modes every 30 s
+dart run bin/mock_vehicle_server.dart --state=cycle
 ```
 
 Listens on UDP `7000`, sends to GCS on `7500` (see `lib/config/server_config.dart`).
 
 On start it also launches a GStreamer H.264 RTP test pattern to `udp://127.0.0.1:5000`
 (`gst-launch-1.0` must be on `PATH`).
+
+### Health scenarios (Polaris Connect Flow)
+
+GCS maps `UGV_SYSTEM_INFO` into Battery / Motor / Sensor POST rows. Use `--state=` to hold one outcome:
+
+| `--state` | Battery | Motor | Sensor | GCS header |
+|-----------|---------|-------|--------|------------|
+| `success` (default) | pass | pass | pass | Connection Successful! Please wait redirecting …… |
+| `partial` | pass | **fail** | pass | Error Detected, Please Contact Technical Support for resolution |
+| `failure` | **fail** | **fail** | **fail** | Error Detected, Please Contact Technical Support for resolution |
+| `cycle` | rotates | rotates | rotates | changes every ~5–10 s |
 
 **GCS must use the mock network profile** or commands never reach this process:
 
@@ -31,6 +51,31 @@ static const AppNetworkProfile profile = AppNetworkProfile.mock;
 | Vehicle → GCS | `127.0.0.1:7500` | bind `0.0.0.0:7500` |
 
 With production selected, telemetry can still appear (mock → localhost:7500) while SET_HOME / other commands go to the real vehicle IP and never hit the mock.
+
+### ICD v1.4 MAVLink compliance (§§5.1.6.2–5.1.7.2)
+
+Dialect: `scout_mavlink_dart` **v1.4.0** (same package as GCS).
+
+| ICD | Message | ID / cmd | Rate / notes |
+|-----|---------|----------|--------------|
+| 5.1.6.2.1 | COMP_HEARTBEAT (`HEARTBEAT`) | 0 | 1 Hz outbound |
+| 5.1.6.2.2 | GCS_HEARTBEAT | 0 | inbound |
+| 5.1.6.2.3–.4 | TIMESYNC | 111 | reply when `tc1==0` |
+| 5.1.6.2.5 | MODE | cmd **176** | handled |
+| 5.1.6.2.6 | ARM/DISARM | cmd **400** | handled |
+| 5.1.6.2.7 | DRIVE_MODE | cmd **31900** | handled |
+| 5.1.6.2.8 | MANUAL_CONTROL | 69 | log only |
+| 5.1.6.2.9 | LIGHT | cmd **31901** | handled |
+| 5.1.6.2.10 | CAMERA_MARKER | cmd **31902** | handled |
+| 5.1.6.2.11 | REMOTE_ESTOP | cmd **31904** | handled |
+| 5.1.6.2.12 | SET_HOME | cmd **179** | latch GPS → home |
+| 5.1.6.2.13 | OVERRIDE_SAFETY | cmd **31903** | sets arm override |
+| 5.1.6.2.14 | RTH | cmd **20** | accepted (no path follow) |
+| 5.1.6.2.15 | STATUSTEXT | 253 | not emitted (event-only) |
+| 5.1.7.2.1 | UGV_SYSTEM_INFO | 50001 | 1 Hz, 55-byte payload |
+| 5.1.7.2.2 | SYSTEM_TIME | 2 | one-shot at startup |
+| 5.1.7.2.3 | GPS_RAW_INT | 24 | **10 Hz** |
+| 5.1.7.2.4 | ATTITUDE | 30 | **10 Hz** |
 
 ## Run radio mock (independent)
 

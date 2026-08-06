@@ -2,9 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:mavlink_dart/dialects/ugvcustom.dart';
-import 'package:mavlink_dart/mavlink_parser.dart';
-import 'package:mavlink_dart/mavlink_signature.dart';
+import 'package:scout_mavlink_dart/scout_mavlink_dart.dart';
 
 final _key = Uint8List.fromList([
   0x5f, 0xb2, 0x1c, 0x3a, 0x9e, 0xd4, 0x6f, 0x0b,
