@@ -182,10 +182,12 @@ class _MockUgvState {
   int lvBatterySoc = 78;
   int hvBatterySoc = 65;
 
+  // Defaults match prior locked success scenario (predictable POST), but
+  // COMMAND_LONG handlers may change these — the 1 Hz tick must not clobber.
   int autonomyMode = 1; // Mode A
   int holdState = 1; // 1=Disengaged, 2=Engaged
-  int armMode = 2; // 1=Disarmed, 2=Armed, 3=Override
-  int driveLimit = 2; // 1=Low, 2=Med, 3=High
+  int armMode = 1; // 1=Disarmed, 2=Armed, 3=Override
+  int driveLimit = 1; // 1=Low, 2=Med, 3=High
   int driveMode = 1; // 1=Speed, 2=Torque, 3=Torque+limit
 
   int vehicleEStop = 1; // 1=Disengaged, 2=Engaged, 3=Disabled
@@ -517,36 +519,62 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
   final p1 = cmd.param1.round();
   final p2 = cmd.param2.round();
   final p3 = cmd.param3.round();
+  var stateChanged = false;
 
   switch (cmd.command) {
     case cmdSetMode:
+      // ICD 5.1.6.2.5: param2=autonomy mode, param3=drive limit
       if (p1 == 1) {
-        if (p2 >= 1 && p2 <= 5) s.autonomyMode = p2;
-        if (p3 >= 1 && p3 <= 3) s.driveLimit = p3;
+        if (p2 >= 1 && p2 <= 5) {
+          s.autonomyMode = p2;
+          stateChanged = true;
+        }
+        if (p3 >= 1 && p3 <= 3) {
+          s.driveLimit = p3;
+          stateChanged = true;
+        }
         print('[CMD] SET_MODE mode=$p2 limit=$p3');
       }
     case cmdArmDisarm:
       if (p1 >= 1 && p1 <= 3) {
         s.armMode = p1;
+        stateChanged = true;
         print('[CMD] ARM_DISARM mode=$p1 force=$p2');
       }
     case cmdDriveMode:
       if (p1 >= 1 && p1 <= 3) {
         s.driveMode = p1;
+        stateChanged = true;
         print('[CMD] DRIVE_MODE mode=$p1');
       }
     case cmdLightControl:
-      if (p1 == 0 || p1 == 1) s.headlights = p1 == 1 ? pwrOn : pwrOff;
-      if (p2 == 0 || p2 == 1) s.fogLights = p2 == 1 ? pwrOn : pwrOff;
-      if (p3 == 0 || p3 == 1) s.aftLights = p3 == 1 ? pwrOn : pwrOff;
+      if (p1 == 0 || p1 == 1) {
+        s.headlights = p1 == 1 ? pwrOn : pwrOff;
+        stateChanged = true;
+      }
+      if (p2 == 0 || p2 == 1) {
+        s.fogLights = p2 == 1 ? pwrOn : pwrOff;
+        stateChanged = true;
+      }
+      if (p3 == 0 || p3 == 1) {
+        s.aftLights = p3 == 1 ? pwrOn : pwrOff;
+        stateChanged = true;
+      }
       print('[CMD] LIGHT_CONTROL head=$p1 fog=$p2 aft=$p3');
     case cmdCameraMarker:
-      if (p1 >= 1 && p1 <= 6) s.selectedCameraStream = p1;
-      if (p2 == 0 || p2 == 1) s.rangeMarkerOn = p2;
+      if (p1 >= 1 && p1 <= 6) {
+        s.selectedCameraStream = p1;
+        stateChanged = true;
+      }
+      if (p2 == 0 || p2 == 1) {
+        s.rangeMarkerOn = p2;
+        stateChanged = true;
+      }
       print('[CMD] CAMERA_MARKER stream=$p1 marker=$p2');
     case cmdRemoteEmergency:
       if (p1 >= 1 && p1 <= 3) {
         s.remoteEStop = p1;
+        stateChanged = true;
         print('[CMD] REMOTE_EMERGENCY state=$p1');
       }
     case cmdSetHome:
@@ -555,26 +583,33 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
         s.homeSet = true;
         s.homeLatE7 = s.gpsLatE7;
         s.homeLonE7 = s.gpsLonE7;
+        stateChanged = true;
         print(
           '[CMD] SET_HOME latched GPS_RAW_INT → '
           'lat=${s.homeLatE7} lon=${s.homeLonE7} '
           '(${s.homeLatE7 / 1e7}, ${s.homeLonE7 / 1e7})',
         );
-        // Push UGV_SYSTEM_INFO immediately so GCS sees the latch
-        // before the next GPS motion tick.
-        _send(_buildUgvSystemInfo());
       } else {
         print('[CMD] SET_HOME ignored — param1=$p1 (need 1)');
       }
     case cmdOverrideSafety:
       // ICD 5.1.6.2.13: enter arm override mode
       s.armMode = 3;
+      stateChanged = true;
       print('[CMD] OVERRIDE_SAFETY armMode=3 (Override)');
     case cmdRth:
-      // ICD 5.1.6.2.14: accept RTH (no mission engine in mock)
-      print('[CMD] RTH accepted (no path following in mock)');
+      // ICD 5.1.6.2.14: accept RTH. No dedicated UGV_SYSTEM_INFO field;
+      // mock has no mission/path engine to follow home.
+      print('[CMD] RTH accepted (no UGV_SYSTEM_INFO change / no path follow)');
     default:
+      // Only unknown command IDs reach here (Dart switch does not fall through).
       print('[CMD] unhandled cmd=${cmd.command}');
+  }
+
+  // Reflect command-driven fields in UGV_SYSTEM_INFO immediately (don't wait
+  // for the 1 Hz tick).
+  if (stateChanged) {
+    _send(_buildUgvSystemInfo());
   }
 }
 
@@ -884,14 +919,14 @@ int _send(MavlinkMessage message) {
     );
     final bytes = frame.serialize();
     final sent = _socket.send(bytes.buffer.asUint8List(), _gcsAddress, gcsPort);
-    _logMavlink(
-      direction: 'TX',
-      message: message,
-      systemId: vehicleSysId,
-      componentId: vehicleCompId,
-      sequence: seq,
-      bytes: sent,
-    );
+    // _logMavlink(
+    //   direction: 'TX',
+    //   message: message,
+    //   systemId: vehicleSysId,
+    //   componentId: vehicleCompId,
+    //   sequence: seq,
+    //   bytes: sent,
+    // );
     return sent;
   } catch (e) {
     print('[ERR] Send failed: $e');
@@ -945,15 +980,12 @@ void _tickUgvSystemInfo() {
   s.compInterfaceHealth2 = 0x01FF;
   s.cameraHealthWord = 0x5555;
 
+  // Keep command-driven fields (arm, drive mode/limit, remote estop, lights,
+  // camera stream, home) — only health/fault overlays are reset each tick.
   s.vcuOpState = vcuDrive;
   s.chargerConnected = 0;
   s.charging = 0;
   s.towEngaged = 0;
-  s.vehicleEStop = 1;
-  s.remoteEStop = 1;
-  s.headlights = pwrOn;
-  s.aftLights = pwrOn;
-  s.fogLights = pwrOff;
   // gpsSpeedCms / lat-lon are owned by _tickGpsMotion (slow square path)
   s.rollSpeedRad = 0.0;
 
@@ -967,19 +999,12 @@ void _tickUgvSystemInfo() {
   s.pitchRad = -0.01 * math.cos(_tickCount * 0.1);
 
   if (_healthScenario == HealthScenario.cycle) {
+    // Legacy demo: rotates mode/arm/faults — will overwrite command state.
     _applyCycleScenario(s);
   } else {
-    // Locked Polaris Connect scenarios: freeze mode/arm for predictable POST.
-    s.autonomyMode = 1;
-    s.holdState = 1;
-    s.armMode = 2;
-    s.driveLimit = 1;
-    s.driveMode = 1;
-    s.vcuOpState = vcuDrive;
-
     switch (_healthScenario) {
       case HealthScenario.success:
-        // Baseline already healthy.
+        // Baseline already healthy; command-driven modes persist.
         break;
       case HealthScenario.partial:
         _applyPartialFailure(s);
