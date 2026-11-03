@@ -71,6 +71,11 @@ Dialect: `scout_mavlink_dart` **v1.4.0** (same package as GCS).
 | 5.1.6.2.12 | SET_HOME | cmd **179** | latch GPS → home |
 | 5.1.6.2.13 | OVERRIDE_SAFETY | cmd **31903** | sets arm override |
 | 5.1.6.2.14 | RTH | cmd **20** | accepted (no `UGV_SYSTEM_INFO` field / no path follow) |
+| — | MISSION_COUNT | 44 | inbound; starts an upload |
+| — | MISSION_REQUEST_INT | 51 | outbound; asks for the lowest missing seq, retries every 1 s |
+| — | MISSION_ITEM_INT | 73 | inbound; stored by seq (retries overwrite) |
+| — | MISSION_ACK | 47 | outbound type 0 once seq `0..count-1` are present |
+| — | MISSION_START | cmd **300** | honored only after `MISSION_ACK` |
 | 5.1.6.2.15 | STATUSTEXT | 253 | not emitted (event-only) |
 | 5.1.7.2.1 | UGV_SYSTEM_INFO | 50001 | 1 Hz, 55-byte payload |
 | 5.1.7.2.2 | SYSTEM_TIME | 2 | one-shot at startup |

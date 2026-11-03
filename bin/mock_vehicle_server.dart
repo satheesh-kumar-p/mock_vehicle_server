@@ -38,6 +38,13 @@ const int cmdLightControl = 31901;
 const int cmdCameraMarker = 31902;
 const int cmdOverrideSafety = 31903;
 const int cmdRemoteEmergency = 31904;
+const int cmdMissionStart = 300; // MAV_CMD_MISSION_START
+
+// MAV_MISSION_RESULT: vehicle → GCS once every requested seq is stored.
+const int mavMissionAccepted = 0;
+
+/// Re-ask for the lowest missing seq if GCS does not answer.
+const Duration missionRequestRetry = Duration(seconds: 1);
 
 // Bangalore map center — fixed GPS path center (independent of SET_HOME)
 const int orbitLat = 130828500; // 13.08285°
@@ -290,6 +297,47 @@ class _MockUgvState {
 
 final _state = _MockUgvState();
 
+/// One uploaded waypoint. [latE7] / [lonE7] are MISSION_ITEM_INT x / y.
+class _MissionWaypoint {
+  _MissionWaypoint({required this.seq, required this.latE7, required this.lonE7});
+
+  final int seq;
+  final int latE7;
+  final int lonE7;
+}
+
+/// Vehicle side of the GCS mission upload.
+///
+/// GCS sends MISSION_COUNT, then answers each MISSION_REQUEST_INT with
+/// MISSION_ITEM_INT. This side stores whatever seq arrives (retries included)
+/// and sends MISSION_ACK only after 0..count-1 are all present. MISSION_START
+/// is ignored until that ack has been sent.
+class _MissionTransfer {
+  int expectedCount = 0;
+  final Map<int, _MissionWaypoint> items = {};
+  bool uploadAccepted = false;
+  bool executing = false;
+  Timer? retryTimer;
+
+  void reset(int count) {
+    retryTimer?.cancel();
+    retryTimer = null;
+    expectedCount = count;
+    items.clear();
+    uploadAccepted = false;
+    executing = false;
+  }
+
+  int? firstMissingSeq() {
+    for (var seq = 0; seq < expectedCount; seq++) {
+      if (!items.containsKey(seq)) return seq;
+    }
+    return null;
+  }
+}
+
+final _mission = _MissionTransfer();
+
 Future<void> main(List<String> args) async {
   final scenario = _parseArgs(args);
   if (scenario == null) {
@@ -386,6 +434,8 @@ Future<void> _shutdown() async {
     t.cancel();
   }
   _timers.clear();
+  _mission.retryTimer?.cancel();
+  _mission.retryTimer = null;
   try {
     _socket.close();
   } catch (_) {}
@@ -482,6 +532,16 @@ void _handleIncomingFrame(MavlinkFrame frame) {
 
   if (msg is CommandLong) {
     _handleCommandLong(msg, frame);
+    return;
+  }
+
+  if (msg is MissionCount) {
+    _handleMissionCount(msg);
+    return;
+  }
+
+  if (msg is MissionItemInt) {
+    _handleMissionItemInt(msg);
     return;
   }
 
@@ -601,6 +661,8 @@ void _handleCommandLong(CommandLong cmd, MavlinkFrame frame) {
       // ICD 5.1.6.2.14: accept RTH. No dedicated UGV_SYSTEM_INFO field;
       // mock has no mission/path engine to follow home.
       print('[CMD] RTH accepted (no UGV_SYSTEM_INFO change / no path follow)');
+    case cmdMissionStart:
+      _handleMissionStart(cmd);
     default:
       // Only unknown command IDs reach here (Dart switch does not fall through).
       print('[CMD] unhandled cmd=${cmd.command}');
@@ -861,11 +923,141 @@ UgvSystemInfo _buildUgvSystemInfo() {
   );
 }
 
+// ── Mission upload (vehicle side of the GCS handshake) ───────────────────
+
+bool _addressedToVehicle(int targetSystem, int targetComponent, {bool allowBroadcast = false}) {
+  final systemOk = targetSystem == vehicleSysId || (allowBroadcast && targetSystem == 0);
+  final componentOk =
+      targetComponent == vehicleCompId || (allowBroadcast && targetComponent == 0);
+  return systemOk && componentOk;
+}
+
+void _handleMissionCount(MissionCount msg) {
+  if (!_addressedToVehicle(msg.targetSystem, msg.targetComponent, allowBroadcast: true)) {
+    print(
+      '[MISSION] COUNT ignored — want $vehicleSysId/$vehicleCompId or broadcast '
+      '(got ${msg.targetSystem}/${msg.targetComponent})',
+    );
+    return;
+  }
+
+  _mission.reset(msg.count);
+  print('[MISSION] COUNT=${msg.count} — requesting items');
+
+  if (msg.count == 0) {
+    _sendMissionAck();
+    return;
+  }
+
+  _requestNextMissingItem();
+}
+
+void _handleMissionItemInt(MissionItemInt msg) {
+  if (!_addressedToVehicle(msg.targetSystem, msg.targetComponent)) {
+    print(
+      '[MISSION] ITEM ignored — want $vehicleSysId/$vehicleCompId '
+      '(got ${msg.targetSystem}/${msg.targetComponent})',
+    );
+    return;
+  }
+
+  if (_mission.expectedCount == 0 || _mission.uploadAccepted) {
+    print('[MISSION] ITEM seq=${msg.seq} ignored — no upload in progress');
+    return;
+  }
+
+  if (msg.seq >= _mission.expectedCount) {
+    print(
+      '[MISSION] ITEM seq=${msg.seq} ignored — count=${_mission.expectedCount}',
+    );
+    return;
+  }
+
+  // Store by seq. A retry or an out-of-order reply overwrites that slot.
+  _mission.items[msg.seq] = _MissionWaypoint(
+    seq: msg.seq,
+    latE7: msg.x,
+    lonE7: msg.y,
+  );
+  print(
+    '[MISSION] ITEM seq=${msg.seq} '
+    'lat=${msg.x / 1e7} lon=${msg.y / 1e7} '
+    '(${_mission.items.length}/${_mission.expectedCount})',
+  );
+
+  if (_mission.firstMissingSeq() == null) {
+    _mission.retryTimer?.cancel();
+    _mission.retryTimer = null;
+    _sendMissionAck();
+    return;
+  }
+
+  _requestNextMissingItem();
+}
+
+void _requestNextMissingItem() {
+  final seq = _mission.firstMissingSeq();
+  if (seq == null || _mission.uploadAccepted) return;
+
+
+  _send(MissionRequestInt(
+    seq: seq,
+    targetSystem: gcsSysId,
+    targetComponent: gcsCompId,
+  ));
+  print('[MISSION] REQUEST seq=$seq');
+
+  _mission.retryTimer?.cancel();
+  _mission.retryTimer = Timer(missionRequestRetry, () {
+    if (_mission.uploadAccepted || _mission.firstMissingSeq() == null) return;
+    print('[MISSION] retry');
+    _requestNextMissingItem();
+  });
+}
+
+void _sendMissionAck() {
+  if (_mission.uploadAccepted) return;
+  _mission.uploadAccepted = true;
+  _send(MissionAck(
+    targetSystem: gcsSysId,
+    targetComponent: gcsCompId,
+    type: mavMissionAccepted,
+  ));
+  print(
+    '[MISSION] ACK accepted (${_mission.items.length} items) — '
+    'MISSION_START will be honored',
+  );
+}
+
+void _handleMissionStart(CommandLong cmd) {
+  if (!_mission.uploadAccepted) {
+    print('[CMD] MISSION_START ignored — upload not accepted yet');
+    return;
+  }
+
+  final first = cmd.param1.round();
+  final last = cmd.param2.round();
+  _mission.executing = true;
+  print(
+    '[CMD] MISSION_START first=$first last=$last '
+    '(${_mission.items.length} waypoints stored)',
+  );
+}
+
 // ── Serialize + send ─────────────────────────────────────────────────────
 bool _isHighRateMessage(MavlinkMessage message) {
   return message is GpsRawInt ||
       message is Attitude ||
       message is ManualControl;
+}
+
+/// Mission handshake only. Other TX stays quiet.
+bool _isMissionMessage(MavlinkMessage message) {
+  return message is MissionCount ||
+      message is MissionRequestInt ||
+      message is MissionItemInt ||
+      message is MissionAck ||
+      (message is CommandLong && message.command == cmdMissionStart);
 }
 
 bool _shouldLogMessage(MavlinkMessage message) {
@@ -919,14 +1111,16 @@ int _send(MavlinkMessage message) {
     );
     final bytes = frame.serialize();
     final sent = _socket.send(bytes.buffer.asUint8List(), _gcsAddress, gcsPort);
-    // _logMavlink(
-    //   direction: 'TX',
-    //   message: message,
-    //   systemId: vehicleSysId,
-    //   componentId: vehicleCompId,
-    //   sequence: seq,
-    //   bytes: sent,
-    // );
+    if (_isMissionMessage(message)) {
+      _logMavlink(
+        direction: 'TX',
+        message: message,
+        systemId: vehicleSysId,
+        componentId: vehicleCompId,
+        sequence: seq,
+        bytes: sent,
+      );
+    }
     return sent;
   } catch (e) {
     print('[ERR] Send failed: $e');

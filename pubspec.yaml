@@ -19,7 +19,7 @@ dependencies:
   scout_mavlink_dart:
     git:
       url: https://github.com/newspaceresearch-ugv/scout-td0-mavlink-data-model-generator.git
-      ref: v1.4.0
+      ref: v1.6.0
       path: packages/scout_mavlink_dart
 
 dev_dependencies:
